@@ -84,7 +84,7 @@ svs_stats_dir=""   # Specify the direcotry path for statistics. If empty, automa
 num_splits=1       # Number of splitting for svs corpus.
 teacher_dumpdir="" # Directory of teacher outpus
 write_collected_feats=false # Whether to dump features in stats collection.
-svs_task=svs                # SVS task (svs or gan_svs)
+svs_task=gan_svs                # SVS task (svs or gan_svs)
 pretrained_model=              # Pretrained model to load
 ignore_init_mismatch=false      # Ignore initial mismatch
 
@@ -93,7 +93,7 @@ inference_config="" # Config for decoding.
 inference_args=""   # Arguments for decoding, e.g., "--threshold 0.75".
                     # Note that it will overwrite args in inference config.
 inference_tag=""    # Suffix for decoding directory.
-inference_model=594epoch.pth # Model path for decoding.
+inference_model=647epoch.pth # Model path for decoding.
                                    # e.g.
                                    # inference_model=train.loss.best.pth
                                    # inference_model=3epoch.pth

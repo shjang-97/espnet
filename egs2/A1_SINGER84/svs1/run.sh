@@ -6,12 +6,27 @@ set -u
 set -o pipefail
 
 # spectrogram-related arguments
-fs=22050
-fmin=0
-fmax=11025
-n_fft=2048
-n_shift=512
-win_length=2048
+fs=44100 # 24000 or 441000
+fmin=
+fmax=
+n_fft=
+n_shift=
+win_length=
+
+if [ $fs -eq 24000 ]; then
+    fmin=0
+    fmax=22050
+    n_fft=2048
+    n_shift=300
+    win_length=1200
+elif [ $fs -eq 44100 ]; then
+    fmin=0
+    fmax=22050
+    n_fft=2048
+    n_shift=512
+    win_length=2048
+fi
+
 
 score_feats_extract=syllable_score_feats   # frame_score_feats | syllable_score_feats
 
@@ -32,6 +47,8 @@ cleaner=none
 pitch_extract=dio
 ying_extract=None
 
+tag=add_excitation
+inference_model=14epoch.pth
 ./svs.sh \
     --lang zh \
     --local_data_opts "--stage 0" \
@@ -54,4 +71,6 @@ ying_extract=None
     --test_sets "${test_sets}" \
     --score_feats_extract "${score_feats_extract}" \
     --srctexts "data/${train_set}/text" \
+    --tag ${tag}\
+    --inference_model ${inference_model}\
     ${opts} "$@"

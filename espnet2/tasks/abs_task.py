@@ -691,7 +691,7 @@ class AbsTask(ABC):
         group.add_argument(
             "--ignore_init_mismatch",
             type=str2bool,
-            default=False,
+            default=True,
             help="Ignore size mismatch when loading pre-trained model",
         )
         group.add_argument(

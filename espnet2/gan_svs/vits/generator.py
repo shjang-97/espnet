@@ -43,6 +43,85 @@ from espnet2.gan_tts.vits.posterior_encoder import PosteriorEncoder
 from espnet2.gan_tts.vits.residual_coupling import ResidualAffineCouplingBlock
 
 
+class SourceModuleWithHarmonics(torch.nn.Module):
+    def __init__(self, num_harmonics=6, phoneme_embedding_dim=194, hidden_dim=256, kernel_size=3, sample_rate=22050):
+        super(SourceModuleWithHarmonics, self).__init__()
+
+        self.num_harmonics = num_harmonics
+        self.hidden_dim = hidden_dim
+        self.sample_rate = sample_rate
+
+        # ✅ Phoneme Embedding Dim (194)과 맞추기
+        self.film_mlp = torch.nn.Sequential(
+            torch.nn.Linear(phoneme_embedding_dim, hidden_dim),  
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, num_harmonics * 2)  
+        )
+
+        # 🎯 Attention Mechanism for Harmonic Weighting
+        self.attn_Wp = torch.nn.Linear(phoneme_embedding_dim, hidden_dim)  # ✅ Phoneme Embedding 변환
+        self.attn_We = torch.nn.Linear(num_harmonics, num_harmonics * hidden_dim)
+        self.attn_combine = torch.nn.Linear(hidden_dim, 1)
+
+        # 🎯 Convolutional Layer for Harmonic Merging
+        self.conv_layer = torch.nn.Sequential(
+            torch.nn.Conv1d(in_channels=num_harmonics, out_channels=hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+            torch.nn.ReLU(),
+            torch.nn.Conv1d(in_channels=hidden_dim, out_channels=1, kernel_size=kernel_size, padding=kernel_size//2)
+        )
+
+    def generate_harmonics(self, f0):
+        """
+        F0를 기반으로 Harmonic 신호를 생성하는 함수.
+        f0: (B, T, 1) - 기본 주파수(F0)
+        """
+        B, T, _ = f0.shape
+        harmonics = []
+
+        for h in range(self.num_harmonics):
+            harmonic_freq = (h + 1) * f0.squeeze(-1)  # (B, T) - h번째 Harmonic 주파수
+            phase = 2 * torch.pi * torch.cumsum(harmonic_freq / self.sample_rate, dim=-1)  # 위상 누적
+            excitation = torch.sin(phase)  # Sin 함수로 Excitation 생성
+            harmonics.append(excitation)
+
+        harmonics = torch.stack(harmonics, dim=-1)  # (B, T, num_harmonics)
+        return harmonics
+
+    def forward(self, f0, phoneme_embedding):
+        """
+        f0: (B, T, 1) - 기본 주파수(F0)
+        phoneme_embedding: (B, phoneme_embedding_dim, T) - 음소 임베딩
+        """
+        B, T, _ = f0.shape
+
+        # ✅ 1. `phoneme_embedding` 차원 변환 (B, T, phoneme_embedding_dim)으로 맞춤
+        phoneme_embedding = phoneme_embedding.permute(0, 2, 1)  # (B, T, phoneme_embedding_dim)
+
+        # ✅ 2. Harmonic 신호 생성
+        harmonics = self.generate_harmonics(f0)  # (B, T, num_harmonics)
+
+        # ✅ 3. FiLM 파라미터 생성 (\gamma_P, \beta_P)
+        film_params = self.film_mlp(phoneme_embedding)  # (B, T, num_harmonics * 2)
+        gamma_P, beta_P = torch.chunk(film_params, 2, dim=-1)  # (B, T, num_harmonics), (B, T, num_harmonics)
+
+        # ✅ 4. Harmonic 신호에 FiLM 적용
+        harmonics = gamma_P * harmonics + beta_P  # (B, T, num_harmonics)
+
+        # ✅ 5. Attention 가중치 계산
+        attn_h = self.attn_We(harmonics)  # ✅ (B, T, num_harmonics * hidden_dim)
+        attn_h = attn_h.view(B, T, self.num_harmonics, self.hidden_dim)  # (B, T, num_harmonics, hidden_dim)
+        
+        attn_p = self.attn_Wp(phoneme_embedding).unsqueeze(2)  # (B, T, 1, hidden_dim)
+        attn_score = self.attn_combine(torch.tanh(attn_h + attn_p)).squeeze(-1)  # (B, T, num_harmonics)
+        attn_weights = F.softmax(attn_score, dim=-1)  # (B, T, num_harmonics)
+
+        # ✅ 6. Attention 가중치를 이용하여 Harmonics 병합
+        weighted_harmonics = (attn_weights * harmonics).permute(0, 2, 1)  # (B, num_harmonics, T)
+
+        # ✅ 7. Convolutional Layer를 적용하여 최종 Excitation 신호 생성
+        final_output = self.conv_layer(weighted_harmonics)  # (B, 1, T)
+        
+        return final_output
 class VISingerGenerator(torch.nn.Module):
     """Generator module in VISinger."""
 
@@ -207,6 +286,9 @@ class VISingerGenerator(torch.nn.Module):
         self.use_avocodo = use_avocodo
         self.use_flow = True if flow_flows > 0 else False
         self.use_phoneme_predictor = use_phoneme_predictor
+        num_harmonics = 6
+        self.source_module = SourceModuleWithHarmonics(num_harmonics=num_harmonics, phoneme_embedding_dim=194, sample_rate = fs)
+
         self.text_encoder = TextEncoder(
             vocabs=vocabs,
             attention_dim=hidden_channels,
@@ -566,16 +648,17 @@ class VISingerGenerator(torch.nn.Module):
             predict_lf0, torch.zeros_like(predict_lf0).to(predict_lf0)
         )
 
+        excitation_signal = self.source_module(pitch, decoder_input) 
         if self.generator_type == "visinger2":
             predict_mel, predict_bn_mask = self.mel_decoder(
-                decoder_input + self.f0_prenet(LF0), feats_lengths, g=g
+                decoder_input + self.f0_prenet(excitation_signal), feats_lengths, g=g
             )
 
             predict_energy = (
                 predict_mel.detach().sum(1).unsqueeze(1) / self.aux_channels
             )
 
-        decoder_input = decoder_input + self.f0_prenet(LF0)
+        decoder_input = decoder_input + self.f0_prenet(excitation_signal)
         if self.generator_type == "visinger2":
             decoder_input = (
                 decoder_input
@@ -847,19 +930,27 @@ class VISingerGenerator(torch.nn.Module):
                 decoder_input + decoder_input_pitch, y_lengths, g=g
             )
 
+            F0_std = 500
+            F0 = predict_lf0 * F0_std
+            F0 = F0 / 2595
+            F0 = torch.pow(10, F0)
+            F0 = (F0 - 1) * 700.0
+            F0 = F0.view(1, -1, 1)  # TODO: 이게 inference 할떄는 이걸 적용해줘야 하는데 학습할 때 validation 할때는 모르겠네 ...ㅠㅠ..
+            F0 = torch.max(F0, torch.zeros_like(F0).to(F0))
+            excitation_signal = self.source_module(F0, decoder_input) 
             if self.generator_type == "visinger2":
                 predict_mel, predict_bn_mask = self.mel_decoder(
-                    decoder_input + self.f0_prenet(predict_lf0),
+                    decoder_input + self.f0_prenet(excitation_signal),
                     y_lengths,
                     g=g,
                 )
                 predict_energy = predict_mel.sum(1).unsqueeze(1) / self.aux_channels
 
-            predict_lf0 = torch.max(
-                predict_lf0, torch.zeros_like(predict_lf0).to(predict_lf0)
-            )
+            # predict_lf0 = torch.max(
+            #     predict_lf0, torch.zeros_like(predict_lf0).to(predict_lf0)
+            # )
 
-            decoder_input = decoder_input + self.f0_prenet(predict_lf0)
+            decoder_input = decoder_input + self.f0_prenet(excitation_signal)
             if self.generator_type == "visinger2":
                 decoder_input = (
                     decoder_input
@@ -881,11 +972,7 @@ class VISingerGenerator(torch.nn.Module):
             else:
                 z = z_p
 
-            F0_std = 500
-            F0 = predict_lf0 * F0_std
-            F0 = F0 / 2595
-            F0 = torch.pow(10, F0)
-            F0 = (F0 - 1) * 700.0
+
 
             if self.vocoder_generator_type == "uhifigan":
                 pitch_segments_expended = expand_f0(
